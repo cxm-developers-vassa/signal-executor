@@ -1,9 +1,10 @@
 import { Module } from '@nestjs/common';
-import { BingxController } from './bingx.controller';
+//import { BingxController } from './bingx.controller';
 import { BingxService } from './bingx.service';
 
 @Module({
-  controllers: [BingxController],
+  //controllers: [BingxController],
   providers: [BingxService],
+  exports: [BingxService],
 })
 export class BingxModule {}

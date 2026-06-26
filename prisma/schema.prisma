@@ -1,17 +1,13 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Get a free hosted Postgres database in seconds: `npx create-db`
-
 generator client {
-  provider = "prisma-client"
-  output   = "../generated/prisma"
+  provider     = "prisma-client"
+  output       = "../generated/prisma"
   moduleFormat = "cjs"
 }
 
 datasource db {
-  provider = "mysql"  
+  provider = "mysql"
 }
+
 enum Side {
   LONG
   SHORT
@@ -25,6 +21,47 @@ enum SignalStatus {
   FAILED
 }
 
+enum TradeStatus {
+  ENTERING
+  OPEN
+  CLOSING
+  CLOSED
+  CANCELLED
+  FAILED
+}
+
+enum ConflictStrategy {
+  CONSERVATIVE
+  AGGRESSIVE
+}
+
+enum OrderPurpose {
+  ENTRY
+  CLOSE
+  SAFETY_TP
+  SAFETY_SL
+}
+
+enum OrderType {
+  LIMIT
+  TAKE_PROFIT_MARKET
+  STOP_MARKET
+}
+
+enum OrderSide {
+  BUY
+  SELL
+}
+
+enum OrderStatus {
+  NEW
+  PENDING
+  FILLED
+  PARTIALLYFILLED
+  CANCELLED
+  FAILED
+}
+
 model Signal {
   id        Int          @id @default(autoincrement())
   symbol    String       @db.VarChar(20)
@@ -32,4 +69,69 @@ model Signal {
   status    SignalStatus @default(NEW)
   createdAt DateTime     @default(now())
   updatedAt DateTime     @updatedAt
+  trade     Trade?
+}
+
+model BotConfig {
+  id               Int              @id @default(autoincrement())
+  budget           Decimal          @db.Decimal(20, 8)
+  conflictStrategy ConflictStrategy @default(CONSERVATIVE)
+  isActive         Boolean          @default(false)
+  updatedAt        DateTime         @updatedAt
+}
+
+model SymbolConfig {
+  id                      Int      @id @default(autoincrement())
+  symbol                  String   @unique @db.VarChar(20)
+  isEnabled               Boolean  @default(true)
+  leverage                Int
+  budgetPercent           Decimal  @db.Decimal(10, 4)
+  entryPriceOffsetPercent Decimal  @db.Decimal(10, 4)
+  repriceThresholdPercent Decimal  @db.Decimal(10, 4)
+  entryTimeoutSec         Int
+  takeProfitPercent       Decimal  @db.Decimal(10, 4)
+  stopLossPercent         Decimal  @db.Decimal(10, 4)
+  safetyTpPercent         Decimal  @db.Decimal(10, 4)
+  safetySlPercent         Decimal  @db.Decimal(10, 4)
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+}
+
+model Trade {
+  id            Int         @id @default(autoincrement())
+  signalId      Int         @unique
+  signal        Signal      @relation(fields: [signalId], references: [id])
+  symbol        String      @db.VarChar(20)
+  side          Side
+  status        TradeStatus @default(ENTERING)
+  targetQuantity Decimal    @db.Decimal(20, 8)
+  filledQuantity Decimal    @default(0) @db.Decimal(20, 8)
+  avgEntryPrice Decimal?    @db.Decimal(20, 8)
+  budgetPercent Decimal     @db.Decimal(10, 4)
+  leverage      Int
+  positionId    String?     @db.VarChar(40)
+  takeProfitPrice Decimal?  @db.Decimal(20, 8)
+  stopLossPrice Decimal?    @db.Decimal(20, 8)
+  entryDeadline DateTime?
+  realizedPnl   Decimal?    @db.Decimal(20, 8)
+  orders        Order[]
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+}
+
+model Order {
+  id           Int          @id @default(autoincrement())
+  tradeId      Int
+  trade        Trade        @relation(fields: [tradeId], references: [id])
+  bingxOrderId String       @db.VarChar(40)
+  purpose      OrderPurpose
+  type         OrderType
+  side         OrderSide
+  positionSide Side
+  price        Decimal      @db.Decimal(20, 8)
+  quantity     Decimal      @db.Decimal(20, 8)
+  status       OrderStatus  @default(NEW)
+  executedQty  Decimal      @default(0) @db.Decimal(20, 8)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
 }

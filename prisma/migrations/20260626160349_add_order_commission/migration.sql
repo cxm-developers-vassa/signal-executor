@@ -1,0 +1,2 @@
+-- AlterTable
+ALTER TABLE `Order` ADD COLUMN `commission` DECIMAL(20, 8) NOT NULL DEFAULT 0;

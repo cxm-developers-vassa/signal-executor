@@ -1,14 +1,22 @@
 import { Module } from '@nestjs/common';
+import { ConfigModule } from '@nestjs/config';
+import { ScheduleModule } from '@nestjs/schedule';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
+import { PrismaModule } from './prisma/prisma.module';
 import { SignalsModule } from './signals/signals.module';
-import { ConfigModule } from '@nestjs/config';
 import { BingxModule } from './bingx/bingx.module';
+import { TradingModule } from './trading/trading.module';
 
 @Module({
-  imports: [ConfigModule.forRoot({ isGlobal: true }),
+  imports: [
+    ConfigModule.forRoot({ isGlobal: true }),
+    ScheduleModule.forRoot(),
+    PrismaModule,
     SignalsModule,
-    BingxModule],
+    BingxModule,
+    TradingModule,
+  ],
   controllers: [AppController],
   providers: [AppService],
 })

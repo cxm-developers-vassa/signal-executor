@@ -20,6 +20,22 @@ private buildQueryString(params: Record<string, string | number>): string {
     return sortedKeys.map((key) => `${key}=${allParams[key]}`).join('&');
   }
 
+async getOpenOrders(symbol?: string) {
+    const params: Record<string, string | number> = {};
+    if (symbol) {
+      params.symbol = symbol;
+    }
+    const query = this.buildQueryString(params);
+    const signature = this.sign(query);
+    const url = `${this.baseUrl}/openApi/swap/v2/trade/openOrders?${query}&signature=${signature}`;
+
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: { 'X-BX-APIKEY': this.apiKey },
+    });
+
+    return response.json();
+  }
 
 
 async placeStopOrder(
@@ -50,8 +66,12 @@ async placeStopOrder(
     return response.json();
   }
 
-async getPositions(symbol: string) {
-    const query = this.buildQueryString({ symbol });
+  async getPositions(symbol?: string) {
+    const params: Record<string, string | number> = {};
+    if (symbol) {
+      params.symbol = symbol;
+    }
+    const query = this.buildQueryString(params);
     const signature = this.sign(query);
     const url = `${this.baseUrl}/openApi/swap/v2/user/positions?${query}&signature=${signature}`;
 
@@ -62,6 +82,7 @@ async getPositions(symbol: string) {
 
     return response.json();
   }
+
 
 async cancelOrder(symbol: string, orderId: string) {
     const query = this.buildQueryString({ symbol, orderId });

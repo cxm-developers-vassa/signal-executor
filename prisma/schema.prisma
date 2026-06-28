@@ -107,6 +107,7 @@ model Trade {
   targetQuantity Decimal    @db.Decimal(20, 8)
   filledQuantity Decimal    @default(0) @db.Decimal(20, 8)
   avgEntryPrice Decimal?    @db.Decimal(20, 8)
+  effectiveEntryPrice Decimal? @db.Decimal(20, 8)
   budgetPercent Decimal     @db.Decimal(10, 4)
   leverage      Int
   positionId    String?     @db.VarChar(40)
@@ -132,6 +133,7 @@ model Order {
   quantity     Decimal      @db.Decimal(20, 8)
   status       OrderStatus  @default(NEW)
   executedQty  Decimal      @default(0) @db.Decimal(20, 8)
+  commission   Decimal      @default(0) @db.Decimal(20, 8)
   createdAt    DateTime     @default(now())
   updatedAt    DateTime     @updatedAt
 }

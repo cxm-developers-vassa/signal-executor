@@ -14,6 +14,27 @@ export class BingxService {
       .digest('hex');
   }
 
+  async getPositionHistory(symbol: string, startTs: number, endTs: number, positionId?: string) {
+    const params: Record<string, string | number> = {
+      symbol,
+      startTs,
+      endTs,
+    };
+    if (positionId) {
+      params.positionId = positionId;
+    }
+    const query = this.buildQueryString(params);
+    const signature = this.sign(query);
+    const url = `${this.baseUrl}/openApi/swap/v1/trade/positionHistory?${query}&signature=${signature}`;
+
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: { 'X-BX-APIKEY': this.apiKey },
+    });
+
+    return response.json();
+  }
+
 private buildQueryString(params: Record<string, string | number>): string {
     const allParams = { ...params, timestamp: Date.now() };
     const sortedKeys = Object.keys(allParams).sort();

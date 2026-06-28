@@ -137,7 +137,10 @@ private async manageActiveTrades() {
       if (trade.status === 'ENTERING') {
         await this.manageEntering(trade, allOpenOrders, allPositions);
       }
-      // позже: OPEN, CLOSING
+      else if (trade.status === 'OPEN') {
+        await this.manageOpen(trade, allOpenOrders, allPositions);
+      }
+      // позже: CLOSING
     }
   }
 
@@ -423,4 +426,200 @@ private async manageEntering(trade: any, allOpenOrders: any[], allPositions: any
     );
   }
   
+private async manageOpen(trade: any, allOpenOrders: any[], allPositions: any[]) {
+    // ===== ПЕРВОЕ: жива ли позиция? =====
+    const position = allPositions.find(
+      (p: any) =>
+        p.symbol === trade.symbol &&
+        p.positionSide === trade.side &&
+        Number(p.positionAmt) !== 0,
+    );
+
+    if (!position) {
+      // Позиция закрылась (страховочным ордером или иначе) — фиксируем результат
+      await this.onPositionClosed(trade);
+      return;
+    }
+
+    // ===== Позиция жива: выставляем/проверяем страховочные TP/SL =====
+    const quantity = Math.abs(Number(position.positionAmt));
+    const closeSide = trade.side === 'LONG' ? 'SELL' : 'BUY';
+
+    const hasTp = await this.hasSafetyOrder(trade, 'SAFETY_TP', 'TAKE_PROFIT_MARKET', allOpenOrders, closeSide);
+    if (!hasTp) {
+      await this.placeSafetyOrder(trade, 'SAFETY_TP', 'TAKE_PROFIT_MARKET', closeSide, quantity);
+    }
+
+    const hasSl = await this.hasSafetyOrder(trade, 'SAFETY_SL', 'STOP_MARKET', allOpenOrders, closeSide);
+    if (!hasSl) {
+      await this.placeSafetyOrder(trade, 'SAFETY_SL', 'STOP_MARKET', closeSide, quantity);
+    }
+
+    // TODO под-шаг 5a: ведение лимитного закрытия в плюс
+  }
+
+
+
+  private async hasSafetyOrder(
+    trade: any,
+    purpose: 'SAFETY_TP' | 'SAFETY_SL',
+    bingxType: 'TAKE_PROFIT_MARKET' | 'STOP_MARKET',
+    allOpenOrders: any[],
+    closeSide: string,
+  ): Promise<boolean> {
+    // Проверка в БД: есть активная запись этого назначения?
+    const inDb = trade.orders.find(
+      (o: any) =>
+        o.purpose === purpose &&
+        ['NEW', 'PENDING'].includes(o.status),
+    );
+
+    // Проверка на бирже: есть условный ордер нужного типа по символу/стороне?
+    const onExchange = allOpenOrders.find(
+      (o: any) =>
+        o.symbol === trade.symbol &&
+        o.type === bingxType &&
+        o.positionSide === trade.side &&
+        o.side === closeSide,
+    );
+
+    return Boolean(inDb) || Boolean(onExchange);
+  }
+
+  private async placeSafetyOrder(
+    trade: any,
+    purpose: 'SAFETY_TP' | 'SAFETY_SL',
+    bingxType: 'TAKE_PROFIT_MARKET' | 'STOP_MARKET',
+    closeSide: string,
+    quantity: number,
+  ) {
+    const config = await this.prisma.symbolConfig.findUnique({
+      where: { symbol: trade.symbol },
+    });
+    if (!config) return;
+
+    const contractInfo = await this.bingx.getContractInfo(trade.symbol);
+    const pricePrecision = contractInfo.data[0].pricePrecision;
+
+    const eff = Number(trade.effectiveEntryPrice);
+    const tpP = Number(config.safetyTpPercent) / 100;
+    const slP = Number(config.safetySlPercent) / 100;
+
+    // Цена триггера в зависимости от назначения и стороны сделки
+    let rawStop: number;
+    if (purpose === 'SAFETY_TP') {
+      rawStop = trade.side === 'LONG' ? eff * (1 + tpP) : eff * (1 - tpP);
+    } else {
+      rawStop = trade.side === 'LONG' ? eff * (1 - slP) : eff * (1 + slP);
+    }
+    const stopPrice = this.roundToPrecision(rawStop, pricePrecision);
+
+    // 1) Запись намерения
+    const orderRecord = await this.prisma.order.create({
+      data: {
+        tradeId: trade.id,
+        bingxOrderId: '',
+        purpose,
+        type: bingxType,
+        side: closeSide as any,
+        positionSide: trade.side,
+        price: stopPrice,
+        quantity,
+        status: 'NEW',
+      },
+    });
+
+    // 2) Выставление на бирже
+    const result = await this.bingx.placeStopOrder(
+      trade.symbol,
+      closeSide as 'BUY' | 'SELL',
+      trade.side,
+      bingxType,
+      stopPrice,
+      quantity,
+    );
+
+    // 3) Фиксация
+    if (result.code === 0 && result.data?.order) {
+      const bingxOrderId = String(result.data.order.orderID || result.data.order.orderId);
+      await this.prisma.order.update({
+        where: { id: orderRecord.id },
+        data: { bingxOrderId, status: 'NEW' },
+      });
+      this.logger.log(
+        `Trade #${trade.id} ${trade.symbol}: ${purpose} выставлен, ` +
+        `триггер=${stopPrice}, qty=${quantity}, bingxId=${bingxOrderId}`,
+      );
+    } else {
+      await this.prisma.order.update({
+        where: { id: orderRecord.id },
+        data: { status: 'FAILED' },
+      });
+      this.logger.error(
+        `Trade #${trade.id}: не удалось выставить ${purpose}: ${JSON.stringify(result)}`,
+      );
+    }
+  }
+
+  private async onPositionClosed(trade: any) {
+    this.logger.log(`Trade #${trade.id} ${trade.symbol}: позиция закрыта на бирже, фиксирую результат`);
+
+    let realizedPnl: number | null = null;
+
+    if (trade.positionId) {
+      // Ищем в истории позиций по positionId
+      const now = Date.now();
+      const start = now - 7 * 24 * 60 * 60 * 1000; // последние 7 дней
+      const histResp = await this.bingx.getPositionHistory(
+        trade.symbol,
+        start,
+        now,
+        trade.positionId,
+      );
+      
+      const records = histResp.data?.positionHistory || [];
+      const record = records.find(
+        (r: any) => String(r.positionId) === String(trade.positionId),
+      );
+
+      if (record) {
+        realizedPnl = Number(record.netProfit);
+        this.logger.log(
+          `Trade #${trade.id} ${trade.symbol}: netProfit=${record.netProfit}, ` +
+          `realised=${record.realisedProfit}, commission=${record.positionCommission}`,
+        );
+      } else {
+        this.logger.warn(
+          `Trade #${trade.id}: позиция ${trade.positionId} не найдена в истории`,
+        );
+      }
+    }
+
+    // Помечаем активные ордера сделки финально (биржа их сняла, обновим БД)
+    await this.prisma.order.updateMany({
+      where: {
+        tradeId: trade.id,
+        status: { in: ['NEW', 'PENDING'] },
+      },
+      data: { status: 'CANCELLED' },
+    });
+
+    // Закрываем сделку
+    await this.prisma.trade.update({
+      where: { id: trade.id },
+      data: {
+        status: 'CLOSED',
+        realizedPnl,
+      },
+    });
+
+    // Сигнал — завершён
+    await this.prisma.signal.update({
+      where: { id: trade.signalId },
+      data: { status: 'COMPLETED' },
+    });
+
+    this.logger.log(`Trade #${trade.id} ${trade.symbol}: ЗАКРЫТА, realizedPnl=${realizedPnl}`);
+  }
+
 }

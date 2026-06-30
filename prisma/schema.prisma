@@ -62,6 +62,11 @@ enum OrderStatus {
   FAILED
 }
 
+enum CloseMode {
+  PROFIT
+  LOSS
+}
+
 model Signal {
   id        Int          @id @default(autoincrement())
   symbol    String       @db.VarChar(20)
@@ -113,6 +118,7 @@ model Trade {
   positionId    String?     @db.VarChar(40)
   takeProfitPrice Decimal?  @db.Decimal(20, 8)
   stopLossPrice Decimal?    @db.Decimal(20, 8)
+  closeMode     CloseMode?
   entryDeadline DateTime?
   realizedPnl   Decimal?    @db.Decimal(20, 8)
   orders        Order[]

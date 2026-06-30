@@ -18,6 +18,11 @@ export class TradingService implements OnModuleInit {
     await this.tick();
   }
 
+
+
+
+
+
   @Interval(3000)
   async tick() {
     if (this.isRunning) {
@@ -35,6 +40,12 @@ export class TradingService implements OnModuleInit {
     }
   }
 
+
+
+
+
+
+
   private async processNewSignals() {
     const botConfig = await this.prisma.botConfig.findUnique({ where: { id: 1 } });
     if (!botConfig || !botConfig.isActive) {
@@ -50,6 +61,11 @@ export class TradingService implements OnModuleInit {
       await this.createTradeFromSignal(signal, Number(botConfig.budget));
     }
   }
+
+
+
+
+
 
   private async createTradeFromSignal(
     signal: { id: number; symbol: string; side: 'LONG' | 'SHORT' },
@@ -118,6 +134,11 @@ export class TradingService implements OnModuleInit {
     return Math.floor(value * factor) / factor;
   }   
 
+
+
+
+
+
 private async manageActiveTrades() {
     const activeTrades = await this.prisma.trade.findMany({
       where: { status: { in: ['ENTERING', 'OPEN', 'CLOSING'] } },
@@ -128,10 +149,14 @@ private async manageActiveTrades() {
 
     // Один раз за тик получаем всю картину с биржи
     const openOrdersResp = await this.bingx.getOpenOrders();
-    const allOpenOrders = openOrdersResp.data?.orders || [];
+    const allOpenOrders = Array.isArray(openOrdersResp.data?.orders)
+      ? openOrdersResp.data.orders
+      : [];
 
     const positionsResp = await this.bingx.getPositions();
-    const allPositions = positionsResp.data || [];
+    const allPositions = Array.isArray(positionsResp.data)
+      ? positionsResp.data
+      : [];
 
     for (const trade of activeTrades) {
       if (trade.status === 'ENTERING') {
@@ -140,13 +165,21 @@ private async manageActiveTrades() {
       else if (trade.status === 'OPEN') {
         await this.manageOpen(trade, allOpenOrders, allPositions);
       }
-      // позже: CLOSING
+      else if (trade.status === 'CLOSING') {
+        await this.manageClosing(trade, allPositions);      
     }
+}
   }
 
 
 
 
+
+
+
+
+
+  
 private async manageEntering(trade: any, allOpenOrders: any[], allPositions: any[]) {
     const entryOrder = trade.orders.find(
       (o: any) =>
@@ -454,8 +487,8 @@ private async manageOpen(trade: any, allOpenOrders: any[], allPositions: any[]) 
     if (!hasSl) {
       await this.placeSafetyOrder(trade, 'SAFETY_SL', 'STOP_MARKET', closeSide, quantity);
     }
-
-    // TODO под-шаг 5a: ведение лимитного закрытия в плюс
+    
+     await this.manageClose(trade, position, allOpenOrders);
   }
 
 
@@ -622,4 +655,251 @@ private async manageOpen(trade: any, allOpenOrders: any[], allPositions: any[]) 
     this.logger.log(`Trade #${trade.id} ${trade.symbol}: ЗАКРЫТА, realizedPnl=${realizedPnl}`);
   }
 
+
+  private async manageClose(trade: any, position: any, allOpenOrders: any[]) {
+    const config = await this.prisma.symbolConfig.findUnique({
+      where: { symbol: trade.symbol },
+    });
+    if (!config) return;
+
+    // Если уже в режиме выхода в минус — не передумываем, гоним выход
+    if (trade.closeMode === 'LOSS') {
+      await this.manageLossExit(trade, position);
+      return;
+    }
+
+    const ticker = await this.bingx.getPrice(trade.symbol);
+    const currentPrice = Number(ticker.data.price);
+    const eff = Number(trade.effectiveEntryPrice);
+    const threshold = Number(config.repriceThresholdPercent) / 100;
+    const slPercent = Number(config.stopLossPercent) / 100;
+
+    // Уровень рабочего SL
+    const slLevel = trade.side === 'LONG' ? eff * (1 - slPercent) : eff * (1 + slPercent);
+
+    // Определяем зону
+    const inProfitZone =
+      trade.side === 'LONG'
+        ? currentPrice > eff * (1 + threshold)
+        : currentPrice < eff * (1 - threshold);
+
+    const inLossZone =
+      trade.side === 'LONG'
+        ? currentPrice <= slLevel
+        : currentPrice >= slLevel;
+
+    const existingClose = trade.orders.find(
+      (o: any) => o.purpose === 'CLOSE' && ['NEW', 'PENDING'].includes(o.status),
+    );
+
+    if (inLossZone) {
+      // Цена коснулась рабочего SL → включаем выход в минус
+      this.logger.warn(
+        `Trade #${trade.id} ${trade.symbol}: цена ${currentPrice} достигла SL ${slLevel.toFixed(6)}, выход в минус`,
+      );
+      await this.prisma.trade.update({
+        where: { id: trade.id },
+        data: { closeMode: 'LOSS', status: 'CLOSING' },
+      });
+      // обновим локальный объект, чтобы manageLossExit увидел актуальное
+      trade.closeMode = 'LOSS';
+      await this.manageLossExit(trade, position);
+      return;
+    }
+
+    if (inProfitZone) {
+      // Плюсовая зона → лимит на TP (если ещё нет)
+      if (existingClose) return;
+      await this.placeProfitLimit(trade, position, config);
+      return;
+    }
+
+    // Мёртвая зона → снять рабочий CLOSE-ордер, если висит
+    if (existingClose && existingClose.bingxOrderId) {
+      await this.bingx.cancelOrder(trade.symbol, existingClose.bingxOrderId);
+      await this.prisma.order.update({
+        where: { id: existingClose.id },
+        data: { status: 'CANCELLED' },
+      });
+      this.logger.log(`Trade #${trade.id} ${trade.symbol}: цена в мёртвой зоне, снял лимит закрытия`);
+    }
+  }
+
+private async manageLossExit(trade: any, position: any) {
+    const quantity = Math.abs(Number(position.positionAmt));
+    if (quantity <= 0) return; // позиции нет — закрытие поймает manageClosing
+
+    const closeSide = trade.side === 'LONG' ? 'SELL' : 'BUY';
+
+    const ticker = await this.bingx.getPrice(trade.symbol);
+    const currentPrice = Number(ticker.data.price);
+
+    const contractInfo = await this.bingx.getContractInfo(trade.symbol);
+    const pricePrecision = contractInfo.data[0].pricePrecision;
+    const closePrice = this.roundToPrecision(currentPrice, pricePrecision);
+
+    // Активный CLOSE-ордер?
+    const existingClose = trade.orders.find(
+      (o: any) => o.purpose === 'CLOSE' && ['NEW', 'PENDING'].includes(o.status),
+    );
+
+    // Отменяем старый (переставляем каждый тик по текущей цене)
+    if (existingClose && existingClose.bingxOrderId) {
+      await this.bingx.cancelOrder(trade.symbol, existingClose.bingxOrderId);
+      await this.prisma.order.update({
+        where: { id: existingClose.id },
+        data: { status: 'CANCELLED' },
+      });
+    }
+
+    // Выставляем новый по текущей цене на остаток
+    const orderRecord = await this.prisma.order.create({
+      data: {
+        tradeId: trade.id,
+        bingxOrderId: '',
+        purpose: 'CLOSE',
+        type: 'LIMIT',
+        side: closeSide as any,
+        positionSide: trade.side,
+        price: closePrice,
+        quantity,
+        status: 'NEW',
+      },
+    });
+
+    const result = await this.bingx.placeOrder(
+      trade.symbol, closeSide as 'BUY' | 'SELL', trade.side, closePrice, quantity,
+    );
+
+    if (result.code === 0 && result.data?.order) {
+      const bingxOrderId = String(result.data.order.orderID || result.data.order.orderId);
+      await this.prisma.order.update({
+        where: { id: orderRecord.id },
+        data: { bingxOrderId, status: 'PENDING' },
+      });
+      this.logger.log(
+        `Trade #${trade.id} ${trade.symbol}: выход в минус, лимит по ${closePrice}, qty=${quantity}`,
+      );
+    } else {
+      await this.prisma.order.update({
+        where: { id: orderRecord.id }, data: { status: 'FAILED' },
+      });
+      this.logger.error(`Trade #${trade.id}: не выставить лимит выхода: ${JSON.stringify(result)}`);
+    }
+  }
+
+private async placeProfitLimit(trade: any, position: any, config: any) {
+    const quantity = Math.abs(Number(position.positionAmt));
+    const closeSide = trade.side === 'LONG' ? 'SELL' : 'BUY';
+    const closePrice = Number(trade.takeProfitPrice);
+
+    const orderRecord = await this.prisma.order.create({
+      data: {
+        tradeId: trade.id,
+        bingxOrderId: '',
+        purpose: 'CLOSE',
+        type: 'LIMIT',
+        side: closeSide as any,
+        positionSide: trade.side,
+        price: closePrice,
+        quantity,
+        status: 'NEW',
+      },
+    });
+
+    const result = await this.bingx.placeOrder(
+      trade.symbol, closeSide as 'BUY' | 'SELL', trade.side, closePrice, quantity,
+    );
+
+    if (result.code === 0 && result.data?.order) {
+      const bingxOrderId = String(result.data.order.orderID || result.data.order.orderId);
+      await this.prisma.order.update({
+        where: { id: orderRecord.id },
+        data: { bingxOrderId, status: 'PENDING' },
+      });
+      await this.prisma.trade.update({
+        where: { id: trade.id },
+        data: { status: 'CLOSING', closeMode: 'PROFIT' },
+      });
+      this.logger.log(
+        `Trade #${trade.id} ${trade.symbol}: лимит закрытия в плюс на ${closePrice}, qty=${quantity}, статус CLOSING`,
+      );
+    } else {
+      await this.prisma.order.update({
+        where: { id: orderRecord.id }, data: { status: 'FAILED' },
+      });
+      this.logger.error(`Trade #${trade.id}: не выставить лимит закрытия: ${JSON.stringify(result)}`);
+    }
+  }
+
+
+private async manageClosing(trade: any, allPositions: any[]) {
+    const position = allPositions.find(
+      (p: any) =>
+        p.symbol === trade.symbol &&
+        p.positionSide === trade.side &&
+        Number(p.positionAmt) !== 0,
+    );
+
+    if (!position) {
+      await this.onPositionClosed(trade);
+      return;
+    }
+
+    // Режим LOSS — не передумываем, гоним выход за ценой
+    if (trade.closeMode === 'LOSS') {
+      await this.manageLossExit(trade, position);
+      return;
+    }
+
+    // Режим PROFIT — проверяем, не упала ли цена к рабочему SL (переключение PROFIT→LOSS)
+    if (trade.closeMode === 'PROFIT') {
+      const config = await this.prisma.symbolConfig.findUnique({
+        where: { symbol: trade.symbol },
+      });
+      if (!config) return;
+
+      const ticker = await this.bingx.getPrice(trade.symbol);
+      const currentPrice = Number(ticker.data.price);
+      const eff = Number(trade.effectiveEntryPrice);
+      const slPercent = Number(config.stopLossPercent) / 100;
+      const slLevel = trade.side === 'LONG' ? eff * (1 - slPercent) : eff * (1 + slPercent);
+
+      const inLossZone =
+        trade.side === 'LONG' ? currentPrice <= slLevel : currentPrice >= slLevel;
+
+      if (inLossZone) {
+        this.logger.warn(
+          `Trade #${trade.id} ${trade.symbol}: цена ${currentPrice} упала к SL ${slLevel.toFixed(6)}, ` +
+          `переключаюсь PROFIT→LOSS`,
+        );
+
+        // Снимаем плюсовой лимит на TP
+        const profitOrder = trade.orders.find(
+          (o: any) => o.purpose === 'CLOSE' && ['NEW', 'PENDING'].includes(o.status),
+        );
+        if (profitOrder && profitOrder.bingxOrderId) {
+          await this.bingx.cancelOrder(trade.symbol, profitOrder.bingxOrderId);
+          await this.prisma.order.update({
+            where: { id: profitOrder.id },
+            data: { status: 'CANCELLED' },
+          });
+        }
+
+        // Переключаемся в LOSS и начинаем выход
+        await this.prisma.trade.update({
+          where: { id: trade.id },
+          data: { closeMode: 'LOSS' },
+        });
+        trade.closeMode = 'LOSS';
+        // Обновим локальный список ордеров — снятый больше не активен
+        if (profitOrder) profitOrder.status = 'CANCELLED';
+
+        await this.manageLossExit(trade, position);
+        return;
+      }
+
+      // Цена не упала к SL — плюсовой лимит на TP висит, ждём исполнения
+    }
+  }
 }

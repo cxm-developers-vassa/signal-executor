@@ -12,12 +12,12 @@ export class PositionService {
     private readonly bingx: BingxService,
   ) {}
 
-  // сюда переносим: manageOpen, hasSafetyOrder, placeSafetyOrder,
-  // manageClose, placeProfitLimit, manageLossExit, manageClosing, onPositionClosed
+  
 
 
 
- private async onPositionClosed(trade: any) {
+
+ async onPositionClosed(trade: any) {
     this.logger.log(`Trade #${trade.id} ${trade.symbol}: позиция закрыта на бирже, фиксирую результат`);
 
     let realizedPnl: number | null = null;
@@ -173,7 +173,12 @@ async manageClosing(trade: any, allPositions: any[]) {
       (o: any) => o.purpose === 'CLOSE' && ['NEW', 'PENDING'].includes(o.status),
     );
 
-    // Отменяем старый (переставляем каждый тик по текущей цене)
+  // Если уже есть ордер на этой же цене — ничего не делаем (не переставляем впустую)
+    if (existingClose && Number(existingClose.price) === closePrice) {
+      return;
+    }
+
+    // Отменяем старый (переставляем по текущей цене)
     if (existingClose && existingClose.bingxOrderId) {
       await this.bingx.cancelOrder(trade.symbol, existingClose.bingxOrderId);
       await this.prisma.order.update({

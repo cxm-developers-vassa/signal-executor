@@ -20,8 +20,9 @@ export class TradingService implements OnModuleInit {
     private readonly position: PositionService,
   ) {}
 
-  async onModuleInit() {
-    this.logger.log('TradingService запущен');
+  async onModuleInit() {    
+     await this.reconcileOnStartup();
+     this.logger.log('TradingService запущен');
     await this.tick();
   }
 
@@ -90,6 +91,88 @@ private async manageActiveTrades() {
         await this.position.manageClosing(trade, allPositions);      
     }
 }
+}
+
+async reconcileOnStartup() {
+    this.logger.log('=== Reconciliation при старте ===');
+
+    const activeTrades = await this.prisma.trade.findMany({
+      where: { status: { in: ['ENTERING', 'OPEN', 'CLOSING'] } },
+      include: { orders: true },
+    });
+
+    // Получаем позиции с биржи ВСЕГДА (нужны для обоих шагов)
+    const positionsResp = await this.bingx.getPositions();
+    const allPositions = Array.isArray(positionsResp.data) ? positionsResp.data : [];
+
+    // === Шаг 1: сверка активных сделок из БД ===
+    if (activeTrades.length === 0) {
+      this.logger.log('Нет активных сделок для сверки');
+    } else {
+      this.logger.log(`Сверяю ${activeTrades.length} активных сделок с биржей`);
+      for (const trade of activeTrades) {
+        await this.reconcileTrade(trade, allPositions);
+      }
+    }
+
+    // === Шаг 2: осиротевшие позиции (выполняется ВСЕГДА) ===
+    for (const position of allPositions) {
+      if (Number(position.positionAmt) === 0) continue;
+      const matched = activeTrades.find(
+        (t: any) => t.symbol === position.symbol && t.side === position.positionSide,
+      );
+      if (!matched) {
+        this.logger.warn(
+          `⚠️ Осиротевшая позиция на бирже: ${position.symbol} ${position.positionSide} ` +
+          `${position.positionAmt} — нет активной сделки в БД (не трогаю)`,
+        );
+      }
+    }
+
+    this.logger.log('=== Reconciliation завершён ===');
+  }
+
+
+
+private async reconcileTrade(trade: any, allPositions: any[]) {
+    const position = allPositions.find(
+      (p: any) =>
+        p.symbol === trade.symbol &&
+        p.positionSide === trade.side &&
+        Number(p.positionAmt) !== 0,
+    );
+
+    if (position) {
+      if (trade.status === 'ENTERING') {
+        this.logger.log(`Trade #${trade.id} ${trade.symbol}: позиция есть, вход завершён → OPEN`);
+        await this.entry.onEntryFilled(trade, allPositions);
+      } else {
+        this.logger.log(`Trade #${trade.id} ${trade.symbol}: позиция жива (${position.positionAmt}), статус ${trade.status}`);
+      }
+    } else {
+      const totalFilled = trade.orders
+        .filter((o: any) => o.purpose === 'ENTRY')
+        .reduce((sum: number, o: any) => sum + Number(o.executedQty), 0);
+
+      if (totalFilled > 0 || trade.status === 'OPEN' || trade.status === 'CLOSING') {
+        this.logger.log(`Trade #${trade.id} ${trade.symbol}: позиции нет, сделка закрылась → фиксирую результат`);
+        await this.position.onPositionClosed(trade);
+      } else {
+        this.logger.log(`Trade #${trade.id} ${trade.symbol}: позиции нет, вход не состоялся → CANCELLED`);
+        await this.prisma.trade.update({
+          where: { id: trade.id },
+          data: { status: 'CANCELLED' },
+        });
+        await this.prisma.signal.update({
+          where: { id: trade.signalId },
+          data: { status: 'CANCELLED' },
+        });
+      }
+    }
+  }
+
+
+
   }
 
 
@@ -118,5 +201,3 @@ private async manageActiveTrades() {
 
 
 
-
-}

@@ -373,7 +373,7 @@ private async placeEntryOrder(trade: any, allOpenOrders: any[], allPositions: an
 
 
 
-  private async onEntryFilled(trade: any, allPositions: any[]) {
+  async onEntryFilled(trade: any, allPositions: any[]) {
     // Сверка с реальной позицией на бирже
     const position = allPositions.find(
       (p: any) =>

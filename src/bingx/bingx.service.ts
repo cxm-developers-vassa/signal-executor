@@ -6,6 +6,7 @@ export class BingxService {
   private readonly apiKey = process.env.BINGX_API_KEY as string;
   private readonly apiSecret = process.env.BINGX_API_SECRET as string;
   private readonly baseUrl = process.env.BINGX_BASE_URL as string;
+  private contractInfoCache = new Map<string, any>();
 
   private sign(queryString: string): string {
     return crypto
@@ -13,6 +14,20 @@ export class BingxService {
       .update(queryString)
       .digest('hex');
   }
+
+
+
+private async fetchWithTimeout(url: string, options: any, timeoutMs = 5000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      return response;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
 
   async getPositionHistory(symbol: string, startTs: number, endTs: number, positionId?: string) {
     const params: Record<string, string | number> = {
@@ -27,7 +42,7 @@ export class BingxService {
     const signature = this.sign(query);
     const url = `${this.baseUrl}/openApi/swap/v1/trade/positionHistory?${query}&signature=${signature}`;
 
-    const response = await fetch(url, {
+    const response = await this.fetchWithTimeout(url, {
       method: 'GET',
       headers: { 'X-BX-APIKEY': this.apiKey },
     });
@@ -41,6 +56,7 @@ private buildQueryString(params: Record<string, string | number>): string {
     return sortedKeys.map((key) => `${key}=${allParams[key]}`).join('&');
   }
 
+  
 async getOpenOrders(symbol?: string) {
     const params: Record<string, string | number> = {};
     if (symbol) {
@@ -50,7 +66,7 @@ async getOpenOrders(symbol?: string) {
     const signature = this.sign(query);
     const url = `${this.baseUrl}/openApi/swap/v2/trade/openOrders?${query}&signature=${signature}`;
 
-    const response = await fetch(url, {
+    const response = await this.fetchWithTimeout(url, {
       method: 'GET',
       headers: { 'X-BX-APIKEY': this.apiKey },
     });
@@ -79,7 +95,7 @@ async placeStopOrder(
     const signature = this.sign(query);
     const url = `${this.baseUrl}/openApi/swap/v2/trade/order?${query}&signature=${signature}`;
 
-    const response = await fetch(url, {
+    const response = await this.fetchWithTimeout(url, {
       method: 'POST',
       headers: { 'X-BX-APIKEY': this.apiKey },
     });
@@ -96,7 +112,7 @@ async placeStopOrder(
     const signature = this.sign(query);
     const url = `${this.baseUrl}/openApi/swap/v2/user/positions?${query}&signature=${signature}`;
 
-    const response = await fetch(url, {
+    const response = await this.fetchWithTimeout(url, {
       method: 'GET',
       headers: { 'X-BX-APIKEY': this.apiKey },
     });
@@ -110,7 +126,7 @@ async cancelOrder(symbol: string, orderId: string) {
     const signature = this.sign(query);
     const url = `${this.baseUrl}/openApi/swap/v2/trade/order?${query}&signature=${signature}`;
 
-    const response = await fetch(url, {
+    const response = await this.fetchWithTimeout(url, {
       method: 'DELETE',
       headers: { 'X-BX-APIKEY': this.apiKey },
     });
@@ -123,7 +139,7 @@ async queryOrder(symbol: string, orderId: string) {
     const signature = this.sign(query);
     const url = `${this.baseUrl}/openApi/swap/v2/trade/order?${query}&signature=${signature}`;
 
-    const response = await fetch(url, {
+    const response = await this.fetchWithTimeout(url, {
       method: 'GET',
       headers: { 'X-BX-APIKEY': this.apiKey },
     });
@@ -150,7 +166,7 @@ async placeOrder(
     const signature = this.sign(query);
     const url = `${this.baseUrl}/openApi/swap/v2/trade/order?${query}&signature=${signature}`;
 
-    const response = await fetch(url, {
+    const response = await this.fetchWithTimeout(url, {
       method: 'POST',
       headers: { 'X-BX-APIKEY': this.apiKey },
     });
@@ -163,7 +179,7 @@ async getLeverage(symbol: string) {
     const signature = this.sign(query);
     const url = `${this.baseUrl}/openApi/swap/v2/trade/leverage?${query}&signature=${signature}`;
 
-    const response = await fetch(url, {
+    const response = await this.fetchWithTimeout(url, {
       method: 'GET',
       headers: { 'X-BX-APIKEY': this.apiKey },
     });
@@ -180,7 +196,7 @@ async setLeverage(
     const signature = this.sign(query);
     const url = `${this.baseUrl}/openApi/swap/v2/trade/leverage?${query}&signature=${signature}`;
 
-    const response = await fetch(url, {
+    const response = await this.fetchWithTimeout(url, {
       method: 'POST',
       headers: { 'X-BX-APIKEY': this.apiKey },
     });
@@ -189,16 +205,29 @@ async setLeverage(
   }
 
 async getContractInfo(symbol: string) {
+    // Возвращаем из кеша, если уже запрашивали
+    const cached = this.contractInfoCache.get(symbol);
+    if (cached) {
+      return cached;
+    }
+
     const query = this.buildQueryString({ symbol });
     const signature = this.sign(query);
     const url = `${this.baseUrl}/openApi/swap/v2/quote/contracts?${query}&signature=${signature}`;
 
-    const response = await fetch(url, {
+    const response = await this.fetchWithTimeout(url, {
       method: 'GET',
       headers: { 'X-BX-APIKEY': this.apiKey },
     });
 
-    return response.json();
+    const data = await response.json();
+
+    // Кешируем только успешный ответ с данными
+    if (data.code === 0 && data.data) {
+      this.contractInfoCache.set(symbol, data);
+    }
+
+    return data;
   }
 
 async testOrder(
@@ -220,7 +249,7 @@ async testOrder(
     const signature = this.sign(query);
     const url = `${this.baseUrl}/openApi/swap/v2/trade/order/test?${query}&signature=${signature}`;
 
-    const response = await fetch(url, {
+    const response = await this.fetchWithTimeout(url, {
       method: 'POST',
       headers: { 'X-BX-APIKEY': this.apiKey },
     });
@@ -235,7 +264,7 @@ async getPositionMode() {
     const signature = this.sign(query);
     const url = `${this.baseUrl}/openApi/swap/v1/positionSide/dual?${query}&signature=${signature}`;
 
-    const response = await fetch(url, {
+    const response = await this.fetchWithTimeout(url, {
       method: 'GET',
       headers: { 'X-BX-APIKEY': this.apiKey },
     });
@@ -248,7 +277,7 @@ async getPositionMode() {
     const signature = this.sign(query);
     const url = `${this.baseUrl}/openApi/swap/v1/ticker/price?${query}&signature=${signature}`;
 
-    const response = await fetch(url, {
+    const response = await this.fetchWithTimeout(url, {
       method: 'GET',
       headers: { 'X-BX-APIKEY': this.apiKey },
     });
@@ -263,7 +292,7 @@ async getBalance() {
 
     const url = `${this.baseUrl}/openApi/swap/v3/user/balance?${queryString}&signature=${signature}`;
 
-    const response = await fetch(url, {
+    const response = await this.fetchWithTimeout(url, {
       method: 'GET',
       headers: {
         'X-BX-APIKEY': this.apiKey,

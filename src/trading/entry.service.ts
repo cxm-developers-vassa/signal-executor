@@ -35,6 +35,7 @@ async manageEntering(trade: any, allOpenOrders: any[], allPositions: any[]) {
 
     // Проверяем статус ордера на бирже
     const resp = await this.bingx.queryOrder(trade.symbol, entryOrder.bingxOrderId);
+    //this.logger.log(`queryOrder сырой ответ: ${JSON.stringify(resp)}`);
     if (resp.code !== 0 || !resp.data?.order) {
       this.logger.warn(`Trade #${trade.id}: не удалось получить статус ордера`);
       return;
@@ -263,6 +264,7 @@ private async placeEntryOrder(trade: any, allOpenOrders: any[], allPositions: an
           positionId: String(existingPosition.positionId),
         },
       });
+      await this.onEntryFilled(trade, allPositions);
       return;
     }
 

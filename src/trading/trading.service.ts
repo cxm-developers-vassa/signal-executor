@@ -11,6 +11,7 @@ import { PositionService } from './position.service';
 export class TradingService implements OnModuleInit {
   private readonly logger = new Logger(TradingService.name);
   private isRunning = false;
+  private lastHeartbeatAt: Date | null = null;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -31,7 +32,7 @@ export class TradingService implements OnModuleInit {
 
 
 
-  @Interval(3000)
+  @Interval(5000)
   async tick() {
     if (this.isRunning) {
       this.logger.warn('Предыдущий тик ещё работает, пропускаю');
@@ -39,13 +40,22 @@ export class TradingService implements OnModuleInit {
     }
     this.isRunning = true;
     try {
-      await this.signals.processNewSignals();
-      await this.manageActiveTrades();      
+      // Собираем позиции один раз для всего тика
+      const positionsResp = await this.bingx.getPositions();
+      const allPositions = Array.isArray(positionsResp.data) ? positionsResp.data : [];
+
+      await this.signals.processNewSignals(allPositions);
+      await this.manageActiveTrades(allPositions);
+      await this.maybeHeartbeat();
     } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        this.logger.warn('Запрос к бирже прерван по таймауту, повтор на следующем тике');
+      } else {
       this.logger.error('Ошибка в тике', error);
+      }
     } finally {
       this.isRunning = false;
-    }
+    }    
   }
 
 
@@ -54,6 +64,24 @@ export class TradingService implements OnModuleInit {
 
 
   
+private async maybeHeartbeat() {
+    const now = Date.now();
+    const HEARTBEAT_INTERVAL_MS = 10 * 60 * 1000; // 10 минут
+
+    // Ещё не время
+    if (this.lastHeartbeatAt && now - this.lastHeartbeatAt.getTime() < HEARTBEAT_INTERVAL_MS) {
+      return;
+    }
+
+    const activeTrades = await this.prisma.trade.count({
+      where: { status: { in: ['ENTERING', 'OPEN', 'CLOSING'] } },
+    });
+
+    this.logger.log(`💓 Бот жив | тик работает | активных сделок: ${activeTrades}`);
+    this.lastHeartbeatAt = new Date();
+  }
+
+
 
   
 
@@ -61,7 +89,7 @@ export class TradingService implements OnModuleInit {
 
 
 
-private async manageActiveTrades() {
+private async manageActiveTrades(allPositions: any[]) {
     const activeTrades = await this.prisma.trade.findMany({
       where: { status: { in: ['ENTERING', 'OPEN', 'CLOSING'] } },
       include: { orders: true },
@@ -74,11 +102,7 @@ private async manageActiveTrades() {
     const allOpenOrders = Array.isArray(openOrdersResp.data?.orders)
       ? openOrdersResp.data.orders
       : [];
-
-    const positionsResp = await this.bingx.getPositions();
-    const allPositions = Array.isArray(positionsResp.data)
-      ? positionsResp.data
-      : [];
+    
 
     for (const trade of activeTrades) {
       if (trade.status === 'ENTERING') {

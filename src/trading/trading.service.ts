@@ -77,7 +77,7 @@ private async maybeHeartbeat() {
       where: { status: { in: ['ENTERING', 'OPEN', 'CLOSING'] } },
     });
 
-    this.logger.log(`💓 Бот жив | тик работает | активных сделок: ${activeTrades}`);
+    this.logger.log(`💓 Бот жив!! | тик работает | активных сделок: ${activeTrades}`);
     this.lastHeartbeatAt = new Date();
   }
 

@@ -1,7 +1,7 @@
 services:
   mysql:
     image: mysql:8.4
-    container_name: signal-executor-db
+    container_name: signal-prod-db
     restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
@@ -9,9 +9,9 @@ services:
       MYSQL_USER: ${DB_USER}
       MYSQL_PASSWORD: ${DB_PASSWORD}
     ports:
-      - "3306:3306"
+      - "127.0.0.1:3306:3306"
     volumes:
-      - mysql_data:/var/lib/mysql
+      - ${DB_DATA_PATH}:/var/lib/mysql
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_ROOT_PASSWORD}"]
       interval: 5s
@@ -19,14 +19,14 @@ services:
       retries: 10
 
   signal-executor:
-    build: .
-    container_name: signal-executor-app
+    image: signal-executor:latest
+    container_name: signal-prod-app
     restart: unless-stopped
     depends_on:
       mysql:
         condition: service_healthy
     environment:
-      DB_HOST: mysql               # ← имя сервиса БД (у тебя "mysql", не "db")
+      DB_HOST: mysql
       DB_PORT: 3306
       DB_USER: ${DB_USER}
       DB_PASSWORD: ${DB_PASSWORD}
@@ -36,6 +36,3 @@ services:
       BINGX_API_KEY: ${BINGX_API_KEY}
       BINGX_API_SECRET: ${BINGX_API_SECRET}
       BINGX_BASE_URL: ${BINGX_BASE_URL}
-
-volumes:
-  mysql_data:

@@ -6,6 +6,8 @@ import { roundToPrecision } from './trading.utils';
 @Injectable()
 export class PositionService {
   private readonly logger = new Logger(PositionService.name);
+  private closeRetries = new Map<number, number>();
+  private breakevenLogged = new Set<number>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -17,22 +19,18 @@ export class PositionService {
 
 
 
- async onPositionClosed(trade: any) {
+
+  async onPositionClosed(trade: any) {
     this.logger.log(`Trade #${trade.id} ${trade.symbol}: позиция закрыта на бирже, фиксирую результат`);
 
     let realizedPnl: number | null = null;
 
     if (trade.positionId) {
-      // Ищем в истории позиций по positionId
       const now = Date.now();
-      const start = now - 7 * 24 * 60 * 60 * 1000; // последние 7 дней
+      const start = now - 7 * 24 * 60 * 60 * 1000;
       const histResp = await this.bingx.getPositionHistory(
-        trade.symbol,
-        start,
-        now,
-        trade.positionId,
+        trade.symbol, start, now, trade.positionId,
       );
-      
       const records = histResp.data?.positionHistory || [];
       const record = records.find(
         (r: any) => String(r.positionId) === String(trade.positionId),
@@ -45,39 +43,148 @@ export class PositionService {
           `realised=${record.realisedProfit}, commission=${record.positionCommission}`,
         );
       } else {
-        this.logger.warn(
-          `Trade #${trade.id}: позиция ${trade.positionId} не найдена в истории`,
+        // История ещё не подтянулась — даём бирже время (ретрай на следующих тиках)
+        const attempts = (this.closeRetries.get(trade.id) || 0) + 1;
+        const MAX_ATTEMPTS = 10; // ~10 тиков (около минуты при тике 5с)
+
+        if (attempts < MAX_ATTEMPTS) {
+          this.closeRetries.set(trade.id, attempts);
+          this.logger.warn(
+            `Trade #${trade.id}: позиция ${trade.positionId} ещё не в истории ` +
+            `(попытка ${attempts}/${MAX_ATTEMPTS}) — жду, не фиксирую`,
+          );
+          return; // НЕ закрываем сделку, попробуем снова на след. тике
+        }
+
+        // Исчерпали попытки — фиксируем без PnL, чтобы сделка не висела вечно
+        this.logger.error(
+          `Trade #${trade.id}: позиция ${trade.positionId} так и не найдена в истории ` +
+          `после ${MAX_ATTEMPTS} попыток — закрываю с realizedPnl=null`,
         );
       }
     }
 
-    // Помечаем активные ордера сделки финально (биржа их сняла, обновим БД)
+    // Сюда доходим когда: PnL получен ИЛИ исчерпаны попытки
+    this.closeRetries.delete(trade.id); // очищаем счётчик
+
     await this.prisma.order.updateMany({
-      where: {
-        tradeId: trade.id,
-        status: { in: ['NEW', 'PENDING'] },
-      },
+      where: { tradeId: trade.id, status: { in: ['NEW', 'PENDING'] } },
       data: { status: 'CANCELLED' },
     });
 
-    // Закрываем сделку
     await this.prisma.trade.update({
       where: { id: trade.id },
-      data: {
-        status: 'CLOSED',
-        realizedPnl,
-      },
+      data: { status: 'CLOSED', realizedPnl },
     });
 
-    // Сигнал — завершён
     await this.prisma.signal.update({
       where: { id: trade.signalId },
       data: { status: 'COMPLETED' },
     });
 
     this.logger.log(`Trade #${trade.id} ${trade.symbol}: ЗАКРЫТА, realizedPnl=${realizedPnl}`);
+    await this.updateBalanceAfterClose(realizedPnl);
   }
 
+
+  private async updateBalanceAfterClose(realizedPnl: number | null) {
+    if (realizedPnl === null) return; // нет данных о результате — баланс не трогаем
+
+    const botConfig = await this.prisma.botConfig.findUnique({ where: { id: 1 } });
+    if (!botConfig || !botConfig.autoUpdateBalance) return; // фича выключена
+
+    // Консервативное округление: прибыль вниз, убыток больше (floor работает для обоих знаков)
+    const rounded = Math.floor(realizedPnl * 100) / 100;
+    const oldBudget = Number(botConfig.budget);
+    const newBudget = oldBudget + rounded;
+
+    await this.prisma.botConfig.update({
+      where: { id: 1 },
+      data: { budget: newBudget },
+    });
+
+    this.logger.log(
+      `💰 Баланс обновлён: ${oldBudget.toFixed(2)} → ${newBudget.toFixed(2)} (PnL ${rounded.toFixed(2)})`,
+    );
+
+    // === Проверка просадки от стартового баланса ===
+    if (botConfig.startBalance && botConfig.maxDrawdownPercent) {
+      const start = Number(botConfig.startBalance);
+      const maxDd = Number(botConfig.maxDrawdownPercent);
+      const limit = start * (1 - maxDd / 100);
+
+      if (newBudget < limit) {
+        await this.prisma.botConfig.update({
+          where: { id: 1 },
+          data: { isActive: false },
+        });
+        this.logger.error(
+          `🛑 ПРОСАДКА! Баланс ${newBudget.toFixed(2)} < лимит ${limit.toFixed(2)} ` +
+          `(старт ${start.toFixed(2)}, макс. просадка ${maxDd}%) — БОТ ОСТАНОВЛЕН (isActive=false)`,
+        );
+      }
+    }
+  }
+
+
+
+
+private async manageBreakevenExit(trade: any, position: any) {
+    const existing = trade.orders.find(
+      (o: any) => o.purpose === 'CLOSE' && ['NEW', 'PENDING'].includes(o.status),
+    );
+    if (existing) return; // лимит уже стоит, ждём исполнения
+
+    const quantity = Math.abs(Number(position.positionAmt));
+    if (quantity <= 0) return;
+
+    const closeSide = trade.side === 'LONG' ? 'SELL' : 'BUY';
+
+    // Цена безубыточности с округлением в безопасную сторону
+    const contractInfo = await this.bingx.getContractInfo(trade.symbol);
+    const pricePrecision = contractInfo.data[0].pricePrecision;
+    const be = Number(trade.breakevenPrice);
+    // LONG продаём — округляем ВВЕРХ (не ниже безубытка); SHORT откупаем — ВНИЗ
+    const factor = Math.pow(10, pricePrecision);
+    const closePrice =
+      trade.side === 'LONG'
+        ? Math.ceil(be * factor) / factor
+        : Math.floor(be * factor) / factor;
+
+    const orderRecord = await this.prisma.order.create({
+      data: {
+        tradeId: trade.id,
+        bingxOrderId: '',
+        purpose: 'CLOSE',
+        type: 'LIMIT',
+        side: closeSide as any,
+        positionSide: trade.side,
+        price: closePrice,
+        quantity,
+        status: 'NEW',
+      },
+    });
+
+    const result = await this.bingx.placeOrder(
+      trade.symbol, closeSide as 'BUY' | 'SELL', trade.side, closePrice, quantity,
+    );
+
+    if (result.code === 0 && result.data?.order) {
+      const bingxOrderId = String(result.data.order.orderID || result.data.order.orderId);
+      await this.prisma.order.update({
+        where: { id: orderRecord.id },
+        data: { bingxOrderId, status: 'PENDING' },
+      });
+      this.logger.log(
+        `Trade #${trade.id} ${trade.symbol}: BREAKEVEN-лимит на ${closePrice}, qty=${quantity} (не переставляю)`,
+      );
+    } else {
+      await this.prisma.order.update({
+        where: { id: orderRecord.id }, data: { status: 'FAILED' },
+      });
+      this.logger.error(`Trade #${trade.id}: не выставить BREAKEVEN-лимит: ${JSON.stringify(result)}`);
+    }
+  }
 
 
 
@@ -91,7 +198,23 @@ async manageClosing(trade: any, allPositions: any[]) {
     );
 
     if (!position) {
+      this.breakevenLogged.delete(trade.id);
       await this.onPositionClosed(trade);
+      return;
+    }
+
+    // Если вышли из BREAKEVEN-режима — сбрасываем флаг чтобы при следующем входе снова залогировать
+    if (trade.closeMode !== 'BREAKEVEN') {
+      this.breakevenLogged.delete(trade.id);
+    }
+
+    // Режим BREAKEVEN — один лимит на цену безубыточности, не переставляем
+    if (trade.closeMode === 'BREAKEVEN') {
+      if (!this.breakevenLogged.has(trade.id)) {
+        this.logger.log(`#${trade.id} ${trade.symbol}: BREAKEVEN-режим, цена выхода=${Number(trade.breakevenPrice).toFixed(6)}`);
+        this.breakevenLogged.add(trade.id);
+      }
+      await this.manageBreakevenExit(trade, position);
       return;
     }
 

@@ -22,6 +22,8 @@ export class TradingService implements OnModuleInit {
   ) {}
 
   async onModuleInit() {    
+    const commission = await this.bingx.getCommissionRate();
+    this.logger.log(`🔍 Commission rate: ${JSON.stringify(commission)}`);
      await this.reconcileOnStartup();
      this.logger.log('TradingService запущен');
     await this.tick();
@@ -43,6 +45,9 @@ export class TradingService implements OnModuleInit {
       // Собираем позиции один раз для всего тика
       const positionsResp = await this.bingx.getPositions();
       const allPositions = Array.isArray(positionsResp.data) ? positionsResp.data : [];
+      //this.logger.log(`🔍 Позиция пример: ${JSON.stringify(allPositions[0])}`);
+
+      
 
       await this.signals.processNewSignals(allPositions);
       await this.manageActiveTrades(allPositions);

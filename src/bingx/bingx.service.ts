@@ -7,6 +7,7 @@ export class BingxService {
   private readonly apiSecret = process.env.BINGX_API_SECRET as string;
   private readonly baseUrl = process.env.BINGX_BASE_URL as string;
   private contractInfoCache = new Map<string, any>();
+  private commissionCache: { maker: number; taker: number } | null = null;
 
   private sign(queryString: string): string {
     return crypto
@@ -300,5 +301,36 @@ async getBalance() {
     });
 
     return response.json();
+  }
+
+
+  async getCommissionRate() {
+    // Возвращаем из кеша, если уже запрашивали
+    if (this.commissionCache) {
+      return this.commissionCache;
+    }
+
+    const query = this.buildQueryString({ recvWindow: 5000 });
+    const signature = this.sign(query);
+    const url = `${this.baseUrl}/openApi/swap/v2/user/commissionRate?${query}&signature=${signature}`;
+
+    const response = await this.fetchWithTimeout(url, {
+      method: 'GET',
+      headers: { 'X-BX-APIKEY': this.apiKey },
+    });
+
+    const data = await response.json();
+
+    // Структуру ответа проверим по факту (лог ниже), доке верим осторожно
+    if (data.code === 0 && data.data?.commission) {
+      this.commissionCache = {
+        maker: Number(data.data.commission.makerCommissionRate),
+        taker: Number(data.data.commission.takerCommissionRate),
+      };
+      return this.commissionCache;
+    }
+
+    // Не удалось — вернём сырой ответ, разберём
+    return data;
   }
 }

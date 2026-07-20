@@ -427,6 +427,18 @@ private async placeEntryOrder(trade: any, allOpenOrders: any[], allPositions: an
         ? effectiveEntryPrice * (1 - slPercent)
         : effectiveEntryPrice * (1 + slPercent);
 
+        // Комиссия закрытия (maker) из API
+    const commission = await this.bingx.getCommissionRate();
+    const makerRate = commission?.maker ?? 0.0002; // фолбэк на случай сбоя API
+
+    // Цена безубыточности: покрывает комиссию закрытия
+    // LONG: продать выше eff, чтобы покрыть комиссию выхода
+    // SHORT: откупить ниже eff
+    const breakevenPrice =
+      trade.side === 'LONG'
+        ? effectiveEntryPrice * (1 + makerRate)
+        : effectiveEntryPrice * (1 - makerRate);
+
     await this.prisma.trade.update({
       where: { id: trade.id },
       data: {
@@ -437,13 +449,15 @@ private async placeEntryOrder(trade: any, allOpenOrders: any[], allPositions: an
         positionId,
         takeProfitPrice,
         stopLossPrice,
+        breakevenPrice,
       },
     });
 
     this.logger.log(
       `Trade #${trade.id} ${trade.symbol}: позиция ОТКРЫТА. ` +
       `avg=${avgEntryPrice}, eff=${effectiveEntryPrice.toFixed(6)}, ` +
-      `qty=${filledQuantity}, TP=${takeProfitPrice.toFixed(6)}, SL=${stopLossPrice.toFixed(6)}`,
+      `qty=${filledQuantity}, TP=${takeProfitPrice.toFixed(6)}, SL=${stopLossPrice.toFixed(6)}, ` +
+      `breakeven=${breakevenPrice.toFixed(6)}`,
     );
   }
 }

@@ -322,6 +322,16 @@ private async forceCloseTrade(trade: any) {
 
 
   private async createTradeFromSignal(signal: any, config: any, budget: number) {
+    // Idempotency: $transaction мог создать сделку но не обновить сигнал — не дублируем
+    const existingTrade = await this.prisma.trade.findUnique({ where: { signalId: signal.id } });
+    if (existingTrade) {
+      this.logger.warn(
+        `Сигнал #${signal.id}: сделка #${existingTrade.id} уже существует — синхронизирую статус сигнала`,
+      );
+      await this.prisma.signal.update({ where: { id: signal.id }, data: { status: 'PROCESSING' } });
+      return;
+    }
+
     const ticker = await this.bingx.getPrice(signal.symbol);
     const currentPrice = Number(ticker.data.price);
 
@@ -342,23 +352,40 @@ private async forceCloseTrade(trade: any) {
 
     const deadline = new Date(Date.now() + config.entryTimeoutSec * 1000);
 
-    await this.prisma.trade.create({
-      data: {
-        signalId: signal.id,
-        symbol: signal.symbol,
-        side: signal.side,
-        status: 'ENTERING',
-        targetQuantity,
-        budgetPercent: config.budgetPercent,
-        leverage,
-        entryDeadline: deadline,
-      },
-    });
-
-    await this.prisma.signal.update({
-      where: { id: signal.id },
-      data: { status: 'PROCESSING' },
-    });
+    try {
+      await this.prisma.$transaction([
+        this.prisma.trade.create({
+          data: {
+            signalId: signal.id,
+            symbol: signal.symbol,
+            side: signal.side,
+            status: 'ENTERING',
+            targetQuantity,
+            budgetPercent: config.budgetPercent,
+            leverage,
+            entryDeadline: deadline,
+          },
+        }),
+        this.prisma.signal.update({
+          where: { id: signal.id },
+          data: { status: 'PROCESSING' },
+        }),
+      ]);
+    } catch (e: any) {
+      if (e.code === 'P2002') {
+        // MariaDB adapter bug: trade.create committed but signal.update failed to roll back.
+        // Recover: find the committed trade and sync signal status.
+        const committed = await this.prisma.trade.findUnique({ where: { signalId: signal.id } });
+        if (committed) {
+          this.logger.warn(
+            `Сигнал #${signal.id}: P2002 поймана — сделка #${committed.id} уже создана, синхронизирую`,
+          );
+          await this.prisma.signal.update({ where: { id: signal.id }, data: { status: 'PROCESSING' } });
+        }
+        return;
+      }
+      throw e;
+    }
 
     this.logger.log(`Создана сделка для сигнала #${signal.id}, статус ENTERING`);
   }

@@ -80,14 +80,16 @@ model Signal {
 }
 
 model BotConfig {
-  id               Int              @id @default(autoincrement())
-  budget           Decimal          @db.Decimal(20, 8)
-  conflictStrategy ConflictStrategy @default(CONSERVATIVE)
-  isActive         Boolean          @default(false)
+  id                 Int              @id @default(autoincrement())
+  budget             Decimal          @db.Decimal(20, 8)
+  conflictStrategy   ConflictStrategy @default(CONSERVATIVE)
+  isActive           Boolean          @default(false)
   autoUpdateBalance  Boolean          @default(false)
   startBalance       Decimal?         @db.Decimal(20, 2)
+  lastStartAt        DateTime?
   maxDrawdownPercent Decimal?         @db.Decimal(10, 4)
-  updatedAt        DateTime         @updatedAt
+  maxGrowthPercent   Decimal?         @db.Decimal(10, 4)
+  updatedAt          DateTime         @updatedAt
 }
 
 model SymbolConfig {

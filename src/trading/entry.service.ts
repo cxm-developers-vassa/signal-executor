@@ -21,8 +21,16 @@ async manageEntering(trade: any, allOpenOrders: any[], allPositions: any[]) {
         ['NEW', 'PENDING', 'PARTIALLYFILLED'].includes(o.status),
     );
 
-    // Нет активного ордера — выставляем (первый раз)
+    // Нет активного ордера
     if (!entryOrder) {
+      // Если есть FILLED-ордер, но позиция ещё не видна (стейл allPositions) — ждём следующего тика
+      const filledOrder = (trade.orders as any[]).find(
+        (o) => o.purpose === 'ENTRY' && o.status === 'FILLED',
+      );
+      if (filledOrder) {
+        await this.onEntryFilled(trade, allPositions);
+        return;
+      }
       await this.placeEntryOrder(trade, allOpenOrders, allPositions);
       return;
     }
@@ -132,26 +140,72 @@ private async repositionEntryOrder(trade: any, entryOrder: any, allPositions: an
     if (drift < threshold) return;
 
     // Цена ушла → отменяем старый ордер
-    await this.bingx.cancelOrder(trade.symbol, entryOrder.bingxOrderId);
+    const cancelResult = await this.bingx.cancelOrder(trade.symbol, entryOrder.bingxOrderId);
+    this.logger.log(
+      `Trade #${trade.id} ${trade.symbol}: отмена ордера ${entryOrder.bingxOrderId} → ` +
+      `cancelCode=${cancelResult?.code}, msg=${cancelResult?.msg ?? '—'}`,
+    );
 
-    // Узнаём фактический статус после отмены (сколько успело исполниться)
+    // Проверяем фактический статус после попытки отмены (биржа — источник правды)
     const resp = await this.bingx.queryOrder(trade.symbol, entryOrder.bingxOrderId);
-    const executedQty = Number(resp.data?.order?.executedQty || entryOrder.executedQty);
-    const commission = Math.abs(Number(resp.data?.order?.commission || entryOrder.commission));
+    const exchangeStatus = resp.data?.order?.status;
+    const executedQty = Number(resp.data?.order?.executedQty ?? entryOrder.executedQty);
+    const commission = Math.abs(Number(resp.data?.order?.commission ?? entryOrder.commission));
+
+    this.logger.log(
+      `Trade #${trade.id} ${trade.symbol}: статус ордера на бирже=${exchangeStatus ?? 'неизвестен'}, ` +
+      `executedQty=${executedQty}, commission=${commission}`,
+    );
+
+    // Только CANCELLED = гарантированно убран с биржи, можно ставить новый
+    // Если статус не CANCELLED — либо всё ещё активен, либо ответ не пришёл: НЕ ставим новый
+    if (exchangeStatus !== 'CANCELLED') {
+      if (exchangeStatus === 'FILLED') {
+        // Ордер исполнился прямо перед отменой — входим
+        await this.prisma.order.update({
+          where: { id: entryOrder.id },
+          data: { status: 'FILLED', executedQty, commission },
+        });
+        await this.onEntryFilled(trade, allPositions);
+      } else {
+        this.logger.error(
+          `Trade #${trade.id} ${trade.symbol}: ордер не подтверждён как CANCELLED ` +
+          `(exchangeStatus=${exchangeStatus ?? 'null'}) — пропускаю переставление`,
+        );
+      }
+      return;
+    }
 
     await this.prisma.order.update({
       where: { id: entryOrder.id },
       data: { status: 'CANCELLED', executedQty, commission },
     });
 
-    // Сколько уже в позиции (истина — реальная позиция)
-    const position = allPositions.find(
+    // Суммируем исполненное: предыдущие ордера (из БД) + текущий (живой ответ биржи)
+    const prevFilled = (trade.orders as any[])
+      .filter((o) => o.purpose === 'ENTRY' && o.id !== entryOrder.id)
+      .reduce((sum, o) => sum + Number(o.executedQty || 0), 0);
+    const alreadyFilled = prevFilled + executedQty;
+
+    // СВЕРКА: реальная позиция на бирже vs учтённое исполнение.
+    // Если позиция БОЛЬШЕ чем мы учли — значит был незаписанный fill (BingX inconsistency).
+    // В этом случае не ставим новый ордер, принимаем позицию как есть.
+    // Если позиция == учтённому (нормальный частичный набор) — продолжаем добор.
+    const existingPosition = allPositions.find(
       (p: any) =>
         p.symbol === trade.symbol &&
         p.positionSide === trade.side &&
         Number(p.positionAmt) !== 0,
     );
-    const alreadyFilled = position ? Math.abs(Number(position.positionAmt)) : 0;
+    const positionAmt = existingPosition ? Math.abs(Number(existingPosition.positionAmt)) : 0;
+    if (positionAmt > alreadyFilled + 0.000001) {
+      this.logger.warn(
+        `Trade #${trade.id} ${trade.symbol}: позиция на бирже ${positionAmt} > учтённого исполнения ${alreadyFilled} ` +
+        `— незаписанный fill, обрабатываю как FILLED, новый ордер не ставлю`,
+      );
+      await this.onEntryFilled(trade, allPositions);
+      return;
+    }
 
     // Остаток для добора
     const remaining = Number(trade.targetQuantity) - alreadyFilled;
@@ -221,16 +275,17 @@ private async repositionEntryOrder(trade: any, entryOrder: any, allPositions: an
 
 
 
-private async placeEntryOrder(trade: any, allOpenOrders: any[], allPositions: any[]) {
+private async placeEntryOrder(trade: any, _allOpenOrders: any[], allPositions: any[]) {
     const config = await this.prisma.symbolConfig.findUnique({
       where: { symbol: trade.symbol },
     });
     if (!config) return;
 
-    // СВЕРКА 1: открытые ордера (фильтруем переданный список по символу/стороне)
-    const existingEntryOrder = allOpenOrders.find(
+    // СВЕРКА 1: живой запрос к бирже по символу — биржа источник правды, кэш может быть устаревшим
+    const liveOrdersResp = await this.bingx.getOpenOrders(trade.symbol);
+    const liveOpenOrders = Array.isArray(liveOrdersResp.data?.orders) ? liveOrdersResp.data.orders : [];
+    const existingEntryOrder = liveOpenOrders.find(
       (o: any) =>
-        o.symbol === trade.symbol &&
         o.positionSide === trade.side &&
         o.side === (trade.side === 'LONG' ? 'BUY' : 'SELL'),
     );

@@ -1,8 +1,9 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import * as crypto from 'crypto';
 
 @Injectable()
 export class BingxService {
+  private readonly logger = new Logger(BingxService.name);
   private readonly apiKey = process.env.BINGX_API_KEY as string;
   private readonly apiSecret = process.env.BINGX_API_SECRET as string;
   private readonly baseUrl = process.env.BINGX_BASE_URL as string;
@@ -155,6 +156,7 @@ async placeOrder(
     price: number,
     quantity: number,
   ) {
+    this.logger.log(`\x1b[90mplaceOrder: ${symbol} ${side}/${positionSide} qty=${quantity} price=${price}\x1b[0m`);
     const query = this.buildQueryString({
       symbol,
       side,
